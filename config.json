@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "countdown_sec": 10,
+  "escape_distance": 120,
+  "block_start_hour": 0,
+  "block_end_hour": 24
+}
