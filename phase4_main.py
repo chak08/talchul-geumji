@@ -9,7 +9,7 @@
 import threading
 import queue
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import psutil
 import ctypes
 import random
@@ -22,7 +22,7 @@ import winreg
 from datetime import date
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageTk
 
 # ── 경로 ──────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -35,11 +35,14 @@ REG_KEY     = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 # ── 기본 설정 ──────────────────────────────────────
 DEFAULT_CONFIG = {
-    "enabled":          True,
-    "countdown_sec":    10,
-    "escape_distance":  120,
-    "block_start_hour": 0,
-    "block_end_hour":   24,
+    "enabled":            True,
+    "countdown_sec":      10,
+    "escape_distance":    120,
+    "block_start_hour":   0,
+    "block_end_hour":     24,
+    "shutdown_enabled":   True,
+    "shutdown_delay_min": 30,
+    "shutdown_image_path": "",
 }
 
 LOL_PROCESSES = [
@@ -54,8 +57,63 @@ LOL_PROCESSES = [
 WINDOW_SIZE = 90
 CHECK_MS    = 80
 
+CAPTCHA_CHARS  = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+CAPTCHA_LENGTH = 5
+CAPTCHA_SEC    = 30
+
 event_queue = queue.Queue()
 exempt_date = None
+
+
+# ── 보안문자 이미지 생성 ───────────────────────────
+def _get_font(size):
+    for path in [
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+        "C:/Windows/Fonts/verdana.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+def generate_captcha():
+    W, H = 240, 80
+    img = Image.new("RGB", (W, H), (18, 18, 38))
+    draw = ImageDraw.Draw(img)
+
+    for _ in range(10):
+        x1, y1 = random.randint(0, W), random.randint(0, H)
+        x2, y2 = random.randint(0, W), random.randint(0, H)
+        c = (random.randint(50, 110), random.randint(50, 110), random.randint(70, 140))
+        draw.line([(x1, y1), (x2, y2)], fill=c, width=2)
+    for _ in range(120):
+        x, y = random.randint(0, W), random.randint(0, H)
+        c = (random.randint(40, 90), random.randint(40, 90), random.randint(60, 120))
+        draw.point((x, y), fill=c)
+
+    answer = ''.join(random.choices(CAPTCHA_CHARS, k=CAPTCHA_LENGTH))
+    font = _get_font(36)
+    slot_w = W // CAPTCHA_LENGTH
+
+    for i, ch in enumerate(answer):
+        ch_img = Image.new("RGBA", (52, 62), (0, 0, 0, 0))
+        ch_draw = ImageDraw.Draw(ch_img)
+        color = (
+            random.randint(180, 255),
+            random.randint(190, 255),
+            random.randint(160, 255),
+            255,
+        )
+        ch_draw.text((6, 8), ch, fill=color, font=font)
+        ch_img = ch_img.rotate(random.randint(-28, 28), expand=False)
+        x = i * slot_w + random.randint(2, 8)
+        y = random.randint(4, 16)
+        img.paste(ch_img, (x, y), ch_img)
+
+    img = img.filter(ImageFilter.GaussianBlur(radius=0.7))
+    return img, answer
 
 
 # ── config ─────────────────────────────────────────
@@ -86,9 +144,9 @@ def get_launch_cmd():
 def is_startup_registered():
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY, 0, winreg.KEY_READ)
-        winreg.QueryValueEx(key, APP_NAME)
+        val, _ = winreg.QueryValueEx(key, APP_NAME)
         winreg.CloseKey(key)
-        return True
+        return val == get_launch_cmd()
     except FileNotFoundError:
         return False
 
@@ -227,6 +285,50 @@ class SettingsWindow:
             font=("Arial", 10)
         ).pack(anchor="w", padx=16)
 
+        # ── 강제 종료 섹션 ──────────────────────────
+        tk.Frame(self.win, bg="#444444", height=1).pack(fill="x", padx=16, pady=8)
+        tk.Label(self.win, text="⏻  강제 종료 설정", bg="#1a1a2e", fg="#ff9500",
+                 font=("Arial", 10, "bold")).pack(anchor="w", padx=16)
+
+        self.var_shutdown = tk.BooleanVar(value=cfg.get("shutdown_enabled", True))
+        tk.Checkbutton(
+            self.win, text="보안 인증 통과 후 N분 뒤 강제 종료",
+            variable=self.var_shutdown,
+            bg="#1a1a2e", fg="white", selectcolor="#333355",
+            activebackground="#1a1a2e", activeforeground="white",
+            font=("Arial", 10)
+        ).pack(anchor="w", padx=16, pady=(4, 0))
+
+        tk.Label(self.win, text="종료까지 대기 시간 (분)",
+                 bg="#1a1a2e", fg="#aaaaaa", font=("Arial", 9)).pack(anchor="w", padx=16, pady=(8, 0))
+        self.var_delay = tk.IntVar(value=cfg.get("shutdown_delay_min", 30))
+        tk.Scale(
+            self.win, from_=1, to=180, orient="horizontal",
+            variable=self.var_delay, bg="#1a1a2e", fg="white",
+            troughcolor="#333355", highlightthickness=0, length=220
+        ).pack(padx=16)
+
+        tk.Label(self.win, text="종료 전 표시할 이미지 (선택)",
+                 bg="#1a1a2e", fg="#aaaaaa", font=("Arial", 9)).pack(anchor="w", padx=16, pady=(8, 0))
+        img_frame = tk.Frame(self.win, bg="#1a1a2e")
+        img_frame.pack(fill="x", padx=16, pady=(2, 0))
+        self.var_img_path = tk.StringVar(value=cfg.get("shutdown_image_path", ""))
+        tk.Entry(
+            img_frame, textvariable=self.var_img_path,
+            bg="#333355", fg="white", insertbackground="white",
+            relief="flat", font=("Arial", 8), width=26
+        ).pack(side="left", ipady=4)
+        tk.Button(
+            img_frame, text="찾기", command=self._browse_image,
+            bg="#555577", fg="white", font=("Arial", 8),
+            relief="flat", cursor="hand2", padx=6
+        ).pack(side="left", padx=(4, 0))
+        tk.Button(
+            img_frame, text="지우기", command=lambda: self.var_img_path.set(""),
+            bg="#444444", fg="#aaaaaa", font=("Arial", 8),
+            relief="flat", cursor="hand2", padx=6
+        ).pack(side="left", padx=(2, 0))
+
         # 저장 버튼
         tk.Button(
             self.win, text="저장", command=self._save,
@@ -239,13 +341,24 @@ class SettingsWindow:
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
         self.win.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
 
+    def _browse_image(self):
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="종료 전 표시할 이미지 선택",
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"), ("모든 파일", "*.*")]
+        )
+        if path:
+            self.var_img_path.set(path)
+
     def _save(self):
-        self.cfg["enabled"]          = self.var_enabled.get()
-        self.cfg["countdown_sec"]    = self.var_countdown.get()
-        self.cfg["block_start_hour"] = self.var_start.get()
-        self.cfg["block_end_hour"]   = self.var_end.get()
+        self.cfg["enabled"]             = self.var_enabled.get()
+        self.cfg["countdown_sec"]       = self.var_countdown.get()
+        self.cfg["block_start_hour"]    = self.var_start.get()
+        self.cfg["block_end_hour"]      = self.var_end.get()
+        self.cfg["shutdown_enabled"]    = self.var_shutdown.get()
+        self.cfg["shutdown_delay_min"]  = self.var_delay.get()
+        self.cfg["shutdown_image_path"] = self.var_img_path.get()
         save_config(self.cfg)
-        # 시작 프로그램 처리
         if self.var_startup.get():
             register_startup()
         else:
@@ -253,6 +366,154 @@ class SettingsWindow:
         self.on_save(self.cfg)
         messagebox.showinfo("저장 완료", "설정이 저장되었습니다.", parent=self.win)
         self.win.destroy()
+
+
+# ── 종료 경고 전체화면 ──────────────────────────────
+class ShutdownWarningWindow:
+    WARN_SEC = 10
+
+    def __init__(self, parent, image_path):
+        self.countdown = self.WARN_SEC
+
+        self.win = tk.Toplevel(parent)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-fullscreen", True)
+        self.win.configure(bg="black")
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+
+        if image_path and os.path.exists(image_path):
+            try:
+                raw = Image.open(image_path).convert("RGB")
+                raw = raw.resize((sw, sh), Image.LANCZOS)
+                self._tk_img = ImageTk.PhotoImage(raw)
+                tk.Label(self.win, image=self._tk_img, bg="black").place(x=0, y=0)
+            except Exception:
+                pass
+
+        # 반투명 오버레이 텍스트
+        self._msg_var = tk.StringVar()
+        tk.Label(
+            self.win, textvariable=self._msg_var,
+            bg="black", fg="#ff3b30",
+            font=("Arial", 28, "bold"),
+            wraplength=sw - 40,
+        ).place(relx=0.5, rely=0.88, anchor="center")
+
+        self._tick()
+
+    def _tick(self):
+        self._msg_var.set(f"⚠  {self.countdown}초 후 컴퓨터가 종료됩니다")
+        if self.countdown <= 0:
+            os.system("shutdown /s /t 0")
+            return
+        self.countdown -= 1
+        self.win.after(1000, self._tick)
+
+
+# ── 보안문자 창 ────────────────────────────────────
+class CaptchaWindow:
+    def __init__(self, parent, on_success, on_fail):
+        self.on_success  = on_success
+        self.on_fail     = on_fail
+        self.countdown   = CAPTCHA_SEC
+        self._running    = True
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("탈출금지 — 보안 인증")
+        self.win.resizable(False, False)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="#1a1a2e")
+        self.win.protocol("WM_DELETE_WINDOW", self._fail)
+
+        tk.Label(self.win, text="🔒 보안 인증", bg="#1a1a2e", fg="white",
+                 font=("Arial", 14, "bold")).pack(pady=(16, 2))
+        tk.Label(self.win, text="아래 문자를 입력하면 오늘 하루 면제!",
+                 bg="#1a1a2e", fg="#aaaaaa", font=("Arial", 9)).pack()
+
+        # 이미지 프레임
+        img_frame = tk.Frame(self.win, bg="#2a2a4a", bd=0)
+        img_frame.pack(padx=24, pady=(12, 4))
+        self._captcha_img, self._answer = generate_captcha()
+        self._tk_img = ImageTk.PhotoImage(self._captcha_img)
+        self._img_label = tk.Label(img_frame, image=self._tk_img, bg="#2a2a4a")
+        self._img_label.pack(padx=6, pady=6)
+
+        tk.Button(self.win, text="🔄  새 문자", command=self._refresh,
+                  bg="#2a2a4a", fg="#aaaaaa", font=("Arial", 8),
+                  relief="flat", cursor="hand2", bd=0).pack()
+
+        # 입력
+        self._var = tk.StringVar()
+        self._entry = tk.Entry(self.win, textvariable=self._var,
+                               font=("Arial", 20, "bold"),
+                               bg="#2a2a4a", fg="white", insertbackground="white",
+                               justify="center", width=9, relief="flat", bd=0)
+        self._entry.pack(pady=(12, 2), padx=24, ipady=6)
+        self._entry.bind("<Return>", lambda e: self._submit())
+        self._entry.focus()
+
+        # 오류 메시지
+        self._err_var = tk.StringVar()
+        tk.Label(self.win, textvariable=self._err_var,
+                 bg="#1a1a2e", fg="#ff3b30", font=("Arial", 9)).pack(pady=(2, 0))
+
+        # 타이머
+        self._timer_var = tk.StringVar()
+        tk.Label(self.win, textvariable=self._timer_var,
+                 bg="#1a1a2e", fg="#ff9500", font=("Arial", 10)).pack(pady=(2, 0))
+
+        tk.Button(self.win, text="확인", command=self._submit,
+                  bg="#0066cc", fg="white", font=("Arial", 12, "bold"),
+                  relief="flat", padx=36, pady=8, cursor="hand2", bd=0).pack(pady=14)
+
+        self.win.update_idletasks()
+        w, h = self.win.winfo_width(), self.win.winfo_height()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+
+        self._tick()
+
+    def _refresh(self):
+        self._captcha_img, self._answer = generate_captcha()
+        self._tk_img = ImageTk.PhotoImage(self._captcha_img)
+        self._img_label.configure(image=self._tk_img)
+        self._var.set("")
+        self._err_var.set("")
+
+    def _tick(self):
+        if not self._running:
+            return
+        self._timer_var.set(f"⏱  {self.countdown}초 남음")
+        if self.countdown <= 0:
+            self._fail()
+            return
+        self.countdown -= 1
+        self.win.after(1000, self._tick)
+
+    def _submit(self):
+        entered = self._var.get().strip().upper()
+        if entered == self._answer:
+            self._running = False
+            self.win.destroy()
+            self.on_success()
+        else:
+            self._err_var.set("❌ 틀렸습니다. 다시 시도하세요.")
+            self._var.set("")
+            self._refresh()
+
+    def _fail(self):
+        if not self._running:
+            return
+        self._running = False
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        self.on_fail()
 
 
 # ── 도망 아이콘 UI ─────────────────────────────────
@@ -281,9 +542,10 @@ class TalchulGeumji:
         self.canvas.bind("<Button-1>", self._on_caught)
         self.canvas.bind("<Button-3>", self._open_settings)
 
-        self.active    = False
-        self.countdown = self.cfg["countdown_sec"]
-        self.tray      = None
+        self.active              = False
+        self.countdown           = self.cfg["countdown_sec"]
+        self.tray                = None
+        self._shutdown_scheduled = False
 
         self._start_tray()
         self._poll_events()
@@ -407,15 +669,39 @@ class TalchulGeumji:
             pass
         self.root.after(CHECK_MS, self._check_mouse)
 
-    # ── 클릭 → 면제 ──
+    # ── 강제 종료 실행 ──
+    def _trigger_shutdown(self):
+        print("[종료] 예약 강제 종료 실행")
+        ShutdownWarningWindow(self.root, self.cfg.get("shutdown_image_path", ""))
+
+    # ── 클릭 → 보안문자 ──
     def _on_caught(self, event=None):
-        global exempt_date
         if not self.active:
             return
-        exempt_date = date.today()
         self.active = False
         self.root.withdraw()
-        print("[면제] 잡았다! 오늘 하루 면제. 즐겜 ㅎ")
+        print("[아이콘 클리어] 보안 인증 창 표시")
+
+        def on_captcha_success():
+            global exempt_date
+            exempt_date = date.today()
+            print("[면제] 보안 인증 통과! 오늘 하루 면제. 즐겜 ㅎ")
+            if self.cfg.get("shutdown_enabled") and not self._shutdown_scheduled:
+                delay_min = self.cfg.get("shutdown_delay_min", 30)
+                delay_ms  = delay_min * 60 * 1000
+                self._shutdown_scheduled = True
+                print(f"[종료예약] {delay_min}분 후 강제 종료 예약됨")
+                self.root.after(delay_ms, self._trigger_shutdown)
+
+        def on_captcha_fail():
+            print("[종료] 보안 인증 실패/시간 초과 — 롤 강제 종료!")
+            killed, failed = kill_lol()
+            if killed:
+                print(f"  종료됨: {', '.join(killed)}")
+            if failed:
+                print(f"  실패(권한 부족): {', '.join(failed)}")
+
+        CaptchaWindow(self.root, on_captcha_success, on_captcha_fail)
 
     # ── 시간 초과 → 종료 ──
     def _time_over(self):
